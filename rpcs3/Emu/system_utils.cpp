@@ -6,6 +6,8 @@
 #include "Utilities/StrUtil.h"
 #include "Utilities/Thread.h"
 #include "Crypto/unpkg.h"
+#include "Crypto/unself.h"
+#include "Crypto/unedat.h"
 
 #include <charconv>
 #include <thread>
@@ -134,7 +136,7 @@ namespace rpcs3::utils
 
 	std::string get_rap_file_path(const std::string& rap)
 	{
-		const std::string home_dir = get_hdd0_dir() + "/home";
+		const std::string home_dir = get_hdd0_dir() + "home";
 
 		std::string rap_path;
 
@@ -152,6 +154,95 @@ namespace rpcs3::utils
 
 		// Return a sample path tested for logging purposes
 		return rap_path;
+	}
+
+	std::string get_c00_unlock_edat_path(const std::string& title_id, const std::string& content_id)
+	{
+		const std::string home_dir = get_hdd0_dir() + "home";
+
+		std::string edat_path;
+
+		for (auto&& entry : fs::dir(home_dir))
+		{
+			if (entry.is_directory && check_user(entry.name))
+			{
+				edat_path = fmt::format("%s/%s/exdata/%s/%s.edat", home_dir, entry.name, title_id, content_id);
+				if (fs::is_file(edat_path))
+				{
+					return edat_path;
+				}
+			}
+		}
+
+		// Return a sample path tested for logging purposes
+		return edat_path;
+	}
+
+	bool verify_c00_unlock_edat(const std::string& title_id, const std::string& content_id)
+	{
+		const std::string edat_path = rpcs3::utils::get_c00_unlock_edat_path(title_id, content_id);
+
+		// Check if user has unlock EDAT installed
+		if (!fs::is_file(edat_path))
+		{
+			sys_log.notice(u8"verify_c00_unlock_edat(): “%s” not found", edat_path);
+			return false;
+		}
+
+		const fs::file enc_file(edat_path);
+		u128 k_licensee = get_default_self_klic();
+		std::string edat_content_id;
+
+		if (!VerifyEDATHeaderWithKLicense(enc_file, edat_path, reinterpret_cast<u8*>(&k_licensee), &edat_content_id))
+		{
+			sys_log.error(u8"verify_c00_unlock_edat(): Failed to verify npd file “%s”", edat_path);
+			return false;
+		}
+
+		if (edat_content_id != content_id)
+		{
+			sys_log.error(u8"verify_c00_unlock_edat(): Content ID mismatch in npd header of “%s”", edat_path);
+			return false;
+		}
+
+		// Check if required RAP is present
+		std::string rap_path = rpcs3::utils::get_rap_file_path(content_id);
+
+		if (!fs::is_file(rap_path))
+		{
+			// Not necessarily an error
+			sys_log.warning(u8"verify_c00_unlock_edat(): RAP file not found: “%s”", rap_path);
+			rap_path = "";
+		}
+
+		// Decrypt EDAT and verify its contents
+		fs::file dec_file = DecryptEDAT(enc_file, edat_path, 8, rap_path, reinterpret_cast<u8*>(&k_licensee), false);
+		if (!dec_file)
+		{
+			sys_log.error(u8"verify_c00_unlock_edat(): Failed to decrypt “%s”", edat_path);
+			return false;
+		}
+
+		u32 magic;
+		dec_file.read<u32>(magic);
+		if (magic != "GOMA"_u32)
+		{
+			sys_log.error(u8"verify_c00_unlock_edat(): Bad header magic in unlock EDAT “%s”", edat_path);
+			return false;
+		}
+
+		// Read null-terminated string
+		dec_file.seek(0x10);
+		dec_file.read<true>(edat_content_id, 0x30);
+		edat_content_id.resize(std::strlen(edat_content_id.c_str()));
+		if (edat_content_id != content_id)
+		{
+			sys_log.error(u8"verify_c00_unlock_edat(): Content ID mismatch in unlock EDAT “%s”", edat_path);
+			return false;
+		}
+
+		// Game has been purchased and EDAT is verified
+		return true;
 	}
 
 	std::string get_sfo_dir_from_game_path(const std::string& game_path, const std::string& title_id)
@@ -192,11 +283,13 @@ namespace rpcs3::utils
 
 		if (category == "HG" && !content_id.empty())
 		{
-			// This is a trial game. Check if the user has a RAP file to unlock it.
-			if (fs::is_file(game_path + "/C00/PARAM.SFO") && fs::is_file(get_rap_file_path(content_id)))
+			// This is a trial game. Check if the user has EDAT file to unlock it.
+			const auto c00_title_id = std::string(psf::get_string(psf, "TITLE_ID"));
+
+			if (fs::is_file(game_path + "/C00/PARAM.SFO") && verify_c00_unlock_edat(c00_title_id, content_id))
 			{
 				// Load full game data.
-				sys_log.notice("Found RAP file %s.rap for trial game %s", content_id, title_id);
+				sys_log.notice("Verified EDAT file %s.edat for trial game %s", content_id, c00_title_id);
 				return game_path + "/C00";
 			}
 		}
